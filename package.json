@@ -1,0 +1,36 @@
+{
+  "name": "medique-print-server",
+  "version": "1.0.0",
+  "description": "Print server for EPSON TM-T82II thermal printer integration with Medique HIS",
+  "main": "print-server.js",
+  "scripts": {
+    "start": "node print-server.js",
+    "dev": "nodemon print-server.js",
+    "test": "curl -X GET http://localhost:3001/health"
+  },
+  "keywords": [
+    "epson",
+    "thermal-printer",
+    "tm-t82ii",
+    "print-server",
+    "espos"
+  ],
+  "author": "Medique HIS",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "body-parser": "^1.20.2",
+    "usb": "^2.10.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "optionalDependencies": {
+    "usb": "^2.10.0",
+    "serialport": "^9.2.8"
+  }
+}
