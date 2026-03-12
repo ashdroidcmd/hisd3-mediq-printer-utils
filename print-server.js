@@ -389,8 +389,10 @@ app.post("/print", async (req, res) => {
 
     // Add department name (bold, normal size)
     receipt += ESC + "E\x01"; // Enable bold
+    receipt += GS + "!" + "\x11";
     receipt += departmentName + LF;
     receipt += ESC + "E\x00"; // Disable bold
+    receipt += ESC + "!" + String.fromCharCode(0x00); // Reset to normal size
 
     // Add timestamp (normal size, centered)
     receipt += LF;
