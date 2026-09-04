@@ -1,311 +1,108 @@
-# EPSON TM-T82II Printer Integration Guide
+# EPSON TM-T82II Print Server (Windows)
 
-## Overview
+Backend service for the Medique kiosk's queue-ticket printing. The frontend
+(`printer-service.ts` / `usePrinter.ts` in `mediq-frontend`) builds ESC/POS
+receipt data and POSTs it here; this server talks to the EPSON TM-T82II
+directly over USB using the `usb` (libusb) package — no Windows print spooler
+involved.
 
-This guide explains how to set up and use the EPSON TM-T82II thermal printer with the Medique Kiosk system.
+## Prerequisites
 
-## Architecture
+- Node.js 14+ (`node --version`)
+- EPSON TM-T82II connected via USB, powered on
+- The printer bound to a **WinUSB** driver via Zadig (see below) — without
+  this, libusb cannot open the device and every request fails with
+  `LIBUSB_ERROR_NOT_SUPPORTED`
 
-The printing system consists of three parts:
+## Install
 
-1. **Frontend Service** (`printer-service.ts`) - Generates ESC/POS commands
-2. **Frontend Hook** (`usePrinter.ts`) - React hook for managing print state
-3. **Backend Server** (`print-server.js`) - Node.js service that handles USB/Network printing
-
-## Setup Instructions
-
-### Option 1: Using Print Server (Recommended)
-
-#### Prerequisites
-
-- Node.js 14+ installed
-- EPSON TM-T82II printer connected via USB or Network
-
-#### Step 1: Install Print Server Dependencies
-
-```bash
-cd src/features/kiosk/utils
-npm install express cors body-parser node-thermal-printer
+```powershell
+npm install
 ```
 
-#### Step 2: Configure Print Server
+## Bind the printer with Zadig (required once, on Windows)
 
-Set up environment variables in your `.env` file:
+By default Windows binds its own printer driver to the device, which claims
+the USB interface and blocks libusb from opening it directly. Zadig replaces
+that binding:
+
+1. Download Zadig: https://zadig.akeo.ie
+2. Plug in the printer and power it on
+3. Open Zadig → **Options → List All Devices**
+4. Select the EPSON TM-T82II (vendor/product ID `04B8`/`0202` by default —
+   confirm via Device Manager or `GET /debug/devices` once the server is
+   running)
+5. Choose **WinUSB** in the driver dropdown and click **Replace Driver**
+
+After this the printer no longer appears as a normal Windows printer — it's
+only reachable through this server. To revert, use Device Manager → the
+device → Update Driver → reinstall the standard/EPSON driver.
+
+## Configure
+
+Copy the relevant variables from `.env.printer.example` into the frontend's
+`.env`:
 
 ```env
-VITE_PRINT_SERVER_URL=http://localhost:3001/print
-PRINT_SERVER_PORT=3001
-PRINT_SERVER_HOST=localhost
+VITE_PRINT_SERVER_URL=http://localhost:3002/print
+VITE_AUTO_PRINT_ENABLED=true
 ```
 
-#### Step 3: Start the Print Server
+Environment variables read by the server itself:
 
-```bash
-node src/features/kiosk/utils/print-server.js
+| Variable           | Default    | Purpose                                   |
+| ------------------ | ---------- | ------------------------------------------ |
+| `PORT`              | `3002`     | Port the server listens on                 |
+| `EPSON_VENDOR_ID`    | `0x04b8`   | USB vendor ID to match                     |
+| `EPSON_PRODUCT_ID`   | `0x0202`   | USB product ID to match                    |
+| `DEBUG`              | `false`    | Verbose per-step connection logging        |
+
+Vendor/product ID can also be changed at runtime via `POST /config` (see
+below) without restarting the server.
+
+## Run
+
+```powershell
+npm start          # node print-server.js
+npm run dev         # nodemon print-server.js (auto-restart on change)
+node print-server.js --debug   # verbose logging
 ```
 
-You should see:
+## API
 
-```
-╔════════════════════════════════════════╗
-║   EPSON TM-T82II Print Server         ║
-║   Running on http://localhost:3001     ║
-╚════════════════════════════════════════╝
-```
+**Main**
+| Method | Path           | Body                                                                 |
+| ------ | -------------- | --------------------------------------------------------------------- |
+| GET    | `/health`      | —                                                                       |
+| GET    | `/printers`    | —                                                                       |
+| GET    | `/config`      | —                                                                       |
+| POST   | `/config`      | `{ vendorId?, productId? }` (hex strings, e.g. `"0x04b8"`)             |
+| POST   | `/print`       | `{ queueNumber, departmentName, serviceName, priorityName?, timestamp?, printerName? }` |
+| POST   | `/test-print`  | —                                                                       |
 
-#### Step 4: Test Printer Connection
+**Debug**
+| Method | Path                     | Purpose                                  |
+| ------ | ------------------------ | ------------------------------------------ |
+| GET    | `/debug/devices`         | List all USB devices with vendor/product IDs |
+| GET    | `/debug/windows-printers`| List printers Windows itself recognizes    |
 
-```bash
-curl -X POST http://localhost:3001/test-print \
-  -H "Content-Type: application/json" \
-  -d '{
-    "printerName": "EPSON TM-T82II",
-    "address": null
-  }'
-```
-
-### Option 2: Network Printer Setup
-
-If your printer is connected via Ethernet:
-
-```bash
-curl -X POST http://localhost:3001/test-print \
-  -H "Content-Type: application/json" \
-  -d '{
-    "printerName": "EPSON TM-T82II",
-    "address": "192.168.1.100",
-    "port": 9100
-  }'
-```
-
-Replace `192.168.1.100` with your printer's IP address.
-
-## Usage in Kiosk
-
-### Automatic Printing
-
-When a queue ticket is generated, the system attempts to print automatically.
-
-### Manual Printing
-
-Users can click the "🖨️ Print Ticket" button to reprint the ticket if the automatic print fails.
-
-### Error Handling
-
-If printing fails, an error alert displays with troubleshooting information.
-
-## API Endpoints
-
-### Health Check
-
-```bash
-GET /health
-```
-
-Response:
-
+`POST /print` responses:
 ```json
-{
-  "status": "ok",
-  "timestamp": "2026-02-20T10:00:00.000Z",
-  "connectedPrinters": ["default"]
-}
-```
-
-### Print Ticket
-
-```bash
-POST /print
-Content-Type: application/json
-
-{
-  "printerName": "EPSON TM-T82II",
-  "queueNumber": "Q-001",
-  "departmentName": "Cardiology",
-  "serviceName": "Consultation",
-  "priorityName": "Emergency",
-  "address": null,
-  "port": 9100
-}
-```
-
-### Test Print
-
-```bash
-POST /test-print
-Content-Type: application/json
-
-{
-  "printerName": "EPSON TM-T82II",
-  "address": null
-}
-```
-
-## Printer Configuration
-
-### EPSON TM-T82II Default Settings
-
-- **Connection**: USB or Ethernet (9100)
-- **Paper Width**: 80mm
-- **Max Characters**: 42 per line
-- **Character Set**: PC852 Latin-2
-- **Print Speed**: Up to 150mm/s
-
-### Changing Settings
-
-Edit `printer-service.ts`:
-
-```typescript
-export const printerService = new EpsonPrinterService({
-  paperWidth: 80, // Change to 58 for smaller paper
-  maxChars: 42, // Auto-calculated based on font
-})
+// success
+{ "success": true, "message": "...", "ticketNumber": "...", "method": "usb", "bytes": 123, "timestamp": "..." }
+// error
+{ "success": false, "error": "...", "troubleshooting": ["...", "..."] }
 ```
 
 ## Troubleshooting
 
-### Printer Not Detected
-
-1. Check USB connection
-2. Verify permissions: Linux users may need `sudo` or add themselves to `dialout` group
-3. On Windows: Install EPSON printer drivers
-4. On macOS: Install EPSON driver from Apple Software Update
-
-### "Port Already in Use"
-
-If port 3001 is already in use:
-
-```bash
-PORT=3002 node src/features/kiosk/utils/print-server.js
-```
-
-Then update `VITE_PRINT_SERVER_URL` to `http://localhost:3002/print`
-
-### Network Printer Not Found
-
-1. Verify printer IP: Print configuration page from printer menu
-2. Ensure printer is on same network as server
-3. Check firewall allows port 9100
-4. Test connectivity: `ping 192.168.1.100`
-
-### ESC/POS Commands Not Supported
-
-Some updates to TM-T82II may require driver updates. Check EPSON website for latest drivers.
-
-## Production Deployment
-
-### For Web Deployment
-
-1. Run print server on a dedicated machine/server connected to the printer
-2. Update `VITE_PRINT_SERVER_URL` to point to server URL
-3. Ensure firewall allows access to print server port
-4. Add authentication if needed:
-
-```typescript
-// In print-server.js
-app.use((req, res, next) => {
-  const token = req.headers.authorization?.split(' ')[1]
-  if (token !== process.env.PRINT_SERVER_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized' })
-  }
-  next()
-})
-```
-
-### For Desktop/Electron App
-
-For Electron apps, you can use USB communication directly:
-
-```typescript
-// Use electron-printer instead
-const electronPrinter = require('electron-printer')
-electronPrinter.print(printerName, data)
-```
-
-## React Component Integration
-
-### Using the Print Hook
-
-```typescript
-import { usePrinter } from '@/features/kiosk/hooks/usePrinter'
-
-function MyComponent() {
-  const { printing, error, printTicket, clearError } = usePrinter({
-    serverUrl: 'http://localhost:3001/print'
-  })
-
-  const handlePrint = async () => {
-    try {
-      await printTicket({
-        queueNumber: 'Q-001',
-        departmentName: 'Cardiology',
-        serviceName: 'Consultation',
-        priorityName: 'Emergency',
-      })
-    } catch (err) {
-      console.error('Print failed:', err)
-    }
-  }
-
-  return (
-    <>
-      {error && <div className="error">{error}</div>}
-      <button onClick={handlePrint} disabled={printing}>
-        {printing ? 'Printing...' : 'Print'}
-      </button>
-    </>
-  )
-}
-```
-
-## Performance Notes
-
-- **Print Time**: ~5-8 seconds per ticket
-- **Server Response Time**: ~2-3 seconds
-- **Concurrent Prints**: Server handles multiple print jobs sequentially
-- **Queue**: Prints are not queued; subsequent prints override pending ones
-
-## Security Considerations
-
-1. Keep print server URL private
-2. Use HTTPS for network transmission
-3. Validate all input on server side
-4. Implement rate limiting:
-
-```typescript
-const rateLimit = require('express-rate-limit')
-const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 30, // 30 requests per minute
-})
-app.post('/print', limiter, (req, res) => {
-  /* ... */
-})
-```
-
-## File Structure
-
-```
-src/features/kiosk/
-├── utils/
-│   ├── printer-service.ts      # ESC/POS command generation
-│   └── print-server.js          # Backend print server
-├── hooks/
-│   └── usePrinter.ts            # React hook for printing
-├── components/
-│   └── TicketGenerated.tsx       # Component with print button
-└── README.md                    # This file
-```
-
-## Support
-
-For issues with the EPSON TM-T82II printer:
-
-1. Check [EPSON TM-T82II Manual](https://www.epson.com/cgi-bin/Store/support/downloads/dlSearch.jsp)
-2. Verify ESC/POS command compatibility
-3. Update printer firmware if available
-4. Contact EPSON support
+| Issue                                | Solution                                                              |
+| ------------------------------------- | ------------------------------------------------------------------------ |
+| `LIBUSB_ERROR_NOT_SUPPORTED`           | Bind the printer to WinUSB via Zadig — see above                        |
+| Printer not found in `/debug/devices`  | Check the USB cable, confirm the printer is powered on                  |
+| Wrong vendor/product ID                | `POST /config` with the correct hex IDs from `/debug/devices`           |
+| `Port 3002 already in use`             | `PORT=3003 npm start` and update `VITE_PRINT_SERVER_URL` to match       |
 
 ## License
 
-This integration is part of the Medique HIS project.
+Part of the Medique HIS project.

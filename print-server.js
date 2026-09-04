@@ -18,15 +18,43 @@ const usb = require("usb");
 
 const app = express();
 const PORT = process.env.PORT || 3002;
+const DEBUG = process.argv.includes("--debug") || process.env.DEBUG === "true";
 
 // Middleware
 app.use(cors());
 app.use(bodyParser.json({ limit: "50mb" }));
 app.use(bodyParser.urlencoded({ limit: "50mb" }));
 
-// EPSON TM-T82II USB IDs (can be overridden via environment variables)
-let EPSON_VENDOR_ID = parseInt(process.env.EPSON_VENDOR_ID || "0x04b8", 16);
-let EPSON_PRODUCT_ID = parseInt(process.env.EPSON_PRODUCT_ID || "0x0202", 16);
+// Logger
+const log = (message, isDebug = false) => {
+  if (isDebug && !DEBUG) return;
+  const timestamp = new Date().toISOString().split("T")[1].split(".")[0];
+  console.log(`[${timestamp}] ${message}`);
+};
+
+// Only ever accept a hex vendor/product ID shaped like "0x04b8" or "04b8".
+const HEX_ID_PATTERN = /^(0x)?[0-9a-fA-F]{1,4}$/;
+
+function isValidHexId(id) {
+  return typeof id === "string" && HEX_ID_PATTERN.test(id);
+}
+
+// EPSON TM-T82II USB IDs (can be overridden via environment variables or POST /config)
+const printerConfig = {
+  name: "EPSON TM-T82II",
+  model: "TM-T82II",
+  paperWidth: 80,
+  vendorId: process.env.EPSON_VENDOR_ID || "0x04b8",
+  productId: process.env.EPSON_PRODUCT_ID || "0x0202",
+};
+
+function currentVendorId() {
+  return parseInt(printerConfig.vendorId, 16);
+}
+
+function currentProductId() {
+  return parseInt(printerConfig.productId, 16);
+}
 
 // Store for connected printers (legacy - kept for compatibility)
 const connectedPrinters = {};
@@ -47,11 +75,12 @@ function findUsbDevice(vendorId, productId) {
 
   // If exact match fails and we're looking for EPSON, try any EPSON printer
   if (!device && vendorId === 0x04b8) {
-    console.log("Exact match not found, searching for any EPSON printer...");
+    log("Exact match not found, searching for any EPSON printer...", true);
     device = devices.find((d) => d.deviceDescriptor.idVendor === 0x04b8);
     if (device) {
-      console.log(
+      log(
         `Found alternate EPSON device: 0x${device.deviceDescriptor.idVendor.toString(16)}:0x${device.deviceDescriptor.idProduct.toString(16)}`,
+        true,
       );
     }
   }
@@ -66,7 +95,7 @@ async function connectPrinter() {
   let device = null;
 
   try {
-    device = findUsbDevice(EPSON_VENDOR_ID, EPSON_PRODUCT_ID);
+    device = findUsbDevice(currentVendorId(), currentProductId());
 
     if (!device) {
       const allDevices = usb.getDeviceList();
@@ -84,16 +113,17 @@ async function connectPrinter() {
       );
     }
 
-    console.log(
+    log(
       `Found EPSON TM-T82II: ${device.busNumber}:${device.deviceAddress}`,
+      true,
     );
 
     // Try to open device
     try {
       device.open();
-      console.log("✓ Device opened");
+      log("✓ Device opened", true);
     } catch (openError) {
-      console.error(`Cannot open device directly: ${openError.message}`);
+      log(`Cannot open device directly: ${openError.message}`);
       throw new Error(
         `Failed to open printer: ${openError.message}. ` +
           `The printer may have Windows drivers preventing USB access. ` +
@@ -108,7 +138,7 @@ async function connectPrinter() {
     let iface = null;
     try {
       iface = device.interface(0);
-      console.log("✓ Interface found");
+      log("✓ Interface found", true);
     } catch (ifError) {
       device.close();
       throw new Error(`Failed to get interface: ${ifError.message}`);
@@ -117,10 +147,10 @@ async function connectPrinter() {
     // Try to claim interface
     try {
       iface.claim();
-      console.log("✓ Interface claimed");
+      log("✓ Interface claimed", true);
     } catch (claimError) {
       device.close();
-      console.error(`Cannot claim interface: ${claimError.message}`);
+      log(`Cannot claim interface: ${claimError.message}`);
       throw new Error(
         `Failed to claim interface: ${claimError.message}. ` +
           `This usually means another driver (Windows printer driver) is using the device.`,
@@ -129,7 +159,7 @@ async function connectPrinter() {
 
     // Find output endpoint
     const endpoints = iface.endpoints;
-    console.log(`Found ${endpoints.length} endpoint(s)`);
+    log(`Found ${endpoints.length} endpoint(s)`, true);
 
     const outEndpoint = endpoints.find((ep) => ep.direction === "out");
 
@@ -139,8 +169,9 @@ async function connectPrinter() {
       throw new Error("No output endpoint found on printer");
     }
 
-    console.log(
+    log(
       `✓ Connected to EPSON TM-T82II (Endpoint: 0x${outEndpoint.address.toString(16)})`,
+      true,
     );
 
     return {
@@ -149,7 +180,7 @@ async function connectPrinter() {
       endpoint: outEndpoint,
     };
   } catch (error) {
-    console.error(`✗ Failed to connect to printer:`, error.message);
+    log(`✗ Failed to connect to printer: ${error.message}`);
     // Clean up if device was opened
     if (device) {
       try {
@@ -169,7 +200,7 @@ async function sendToPrinter(printerConnection, data) {
   return new Promise((resolve, reject) => {
     printerConnection.endpoint.transfer(data, (error) => {
       if (error) {
-        console.error("Transfer error:", error);
+        log(`Transfer error: ${error.message || error}`);
         reject(error);
       } else {
         resolve();
@@ -179,58 +210,10 @@ async function sendToPrinter(printerConnection, data) {
 }
 
 /**
- * Print via Windows Print Spooler (alternative method)
- * This uses the system printer instead of direct USB access
- */
-async function printViaWindowsSpooler(printerName, data) {
-  return new Promise((resolve, reject) => {
-    const { exec } = require("child_process");
-    const fs = require("fs");
-    const path = require("path");
-    const os = require("os");
-
-    // Create temporary file with ESC/POS data
-    const tempFile = path.join(os.tmpdir(), `print_${Date.now()}.bin`);
-
-    try {
-      // Write binary data to temp file
-      fs.writeFileSync(tempFile, data);
-
-      // Use Windows print command - this sends to printer spooler
-      const cmd = `type "${tempFile}" | ${printerName}`;
-
-      exec(cmd, (error, stdout, stderr) => {
-        // Clean up temp file
-        try {
-          fs.unlinkSync(tempFile);
-        } catch (e) {
-          // Ignore cleanup errors
-        }
-
-        if (error) {
-          console.error("Windows print error:", error.message);
-          reject(new Error(`Windows print failed: ${error.message}`));
-        } else {
-          resolve();
-        }
-      });
-    } catch (error) {
-      // Clean up on error
-      try {
-        fs.unlinkSync(tempFile);
-      } catch (e) {
-        // Ignore cleanup errors
-      }
-      reject(error);
-    }
-  });
-}
-
-/**
  * Health check endpoint
  */
 app.get("/health", (req, res) => {
-  const device = findUsbDevice(EPSON_VENDOR_ID, EPSON_PRODUCT_ID);
+  const device = findUsbDevice(currentVendorId(), currentProductId());
   res.json({
     status: "ok",
     timestamp: new Date().toISOString(),
@@ -247,10 +230,10 @@ app.get("/health", (req, res) => {
  */
 app.get("/printers", async (req, res) => {
   try {
-    const device = findUsbDevice(EPSON_VENDOR_ID, EPSON_PRODUCT_ID);
+    const device = findUsbDevice(currentVendorId(), currentProductId());
     res.json({
       available: !!device,
-      printer: "EPSON TM-T82II",
+      printer: printerConfig.name,
       status: device ? "connected" : "not found",
       info: "USB printer detection",
     });
@@ -281,10 +264,11 @@ app.get("/debug/devices", (req, res) => {
       totalDevices: devices.length,
       devices: deviceList,
       currentConfig: {
-        epsonVendorId: "0x" + EPSON_VENDOR_ID.toString(16).padStart(4, "0"),
-        epsonProductId: "0x" + EPSON_PRODUCT_ID.toString(16).padStart(4, "0"),
+        epsonVendorId: "0x" + currentVendorId().toString(16).padStart(4, "0"),
+        epsonProductId:
+          "0x" + currentProductId().toString(16).padStart(4, "0"),
       },
-      instruction: "Use POST /debug/configure to set custom vendor/product IDs",
+      instruction: "Use POST /config to set custom vendor/product IDs",
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -292,32 +276,59 @@ app.get("/debug/devices", (req, res) => {
 });
 
 /**
- * Configure printer IDs
+ * GET /config - Get current configuration
  */
-app.post("/debug/configure", (req, res) => {
+app.get("/config", (req, res) => {
+  res.json({
+    printer: printerConfig,
+    environment: {
+      port: PORT,
+      debug: DEBUG,
+      nodeVersion: process.version,
+      platform: process.platform,
+    },
+  });
+});
+
+/**
+ * POST /config - Update printer vendor/product IDs
+ */
+app.post("/config", (req, res) => {
   try {
     const { vendorId, productId } = req.body;
 
-    if (!vendorId || !productId) {
+    if (vendorId === undefined && productId === undefined) {
       return res.status(400).json({
         error: "Missing vendorId or productId",
         example: { vendorId: "0x04b8", productId: "0x0202" },
       });
     }
 
-    // Parse hex strings
-    EPSON_VENDOR_ID = parseInt(vendorId, 16);
-    EPSON_PRODUCT_ID = parseInt(productId, 16);
+    if (vendorId !== undefined) {
+      if (!isValidHexId(vendorId)) {
+        return res.status(400).json({
+          error: `Invalid vendorId. Expected a hex string like "0x04b8", got: ${vendorId}`,
+        });
+      }
+      printerConfig.vendorId = vendorId;
+    }
 
-    console.log(`✓ Printer configuration updated: ${vendorId}:${productId}`);
+    if (productId !== undefined) {
+      if (!isValidHexId(productId)) {
+        return res.status(400).json({
+          error: `Invalid productId. Expected a hex string like "0x0202", got: ${productId}`,
+        });
+      }
+      printerConfig.productId = productId;
+    }
+
+    log(
+      `✓ Printer configuration updated: ${printerConfig.vendorId}:${printerConfig.productId}`,
+    );
 
     res.json({
       success: true,
-      message: "Printer configuration updated",
-      config: {
-        vendorId,
-        productId,
-      },
+      config: printerConfig,
     });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -329,7 +340,6 @@ app.post("/debug/configure", (req, res) => {
  */
 app.post("/print", async (req, res) => {
   let printerConnection = null;
-  let usedFallbackMethod = false;
 
   try {
     const {
@@ -342,17 +352,17 @@ app.post("/print", async (req, res) => {
     } = req.body;
 
     // Validate required fields
-    if (!queueNumber || !departmentName || !serviceName || !priorityName) {
+    if (!queueNumber || !departmentName || !serviceName) {
       return res.status(400).json({
         error:
-          "Missing required fields: queueNumber, departmentName, serviceName, priorityName",
+          "Missing required fields: queueNumber, departmentName, serviceName",
       });
     }
 
-    console.log(`\n📋 Printing ticket: ${queueNumber}`);
-    console.log(`   Department: ${departmentName}`);
-    console.log(`   Service: ${serviceName}`);
-    console.log(`   Priority: ${priorityName}`);
+    log(`📋 Printing ticket: ${queueNumber}`);
+    log(`   Department: ${departmentName}`);
+    log(`   Service: ${serviceName}`);
+    if (priorityName) log(`   Priority: ${priorityName}`);
 
     // Build ESC/POS commands
     const ESC = "\x1B";
@@ -420,43 +430,44 @@ app.post("/print", async (req, res) => {
 
     // Send to printer
     const data = Buffer.from(receipt, "binary");
-    console.log(`  Sending ${data.length} bytes to printer...`);
+    log(`Sending ${data.length} bytes to printer...`, true);
 
-    // Try USB method first
+    // Send via direct USB
     try {
       printerConnection = await connectPrinter();
       await sendToPrinter(printerConnection, data);
     } catch (usbError) {
-      console.warn("USB method failed, trying Windows Print Spooler...");
-      usedFallbackMethod = true;
-
-      // For Windows, we cannot use direct USB due to driver conflicts
-      // Instead, provide a helpful error message with instructions
       throw new Error(
         `USB Access Blocked: ${usbError.message}. ` +
           `On Windows, the printer driver prevents direct USB access via libusb. ` +
-          `Workaround: Use PowerShell to create a print job or reconfigure printer drivers.`,
+          `Use Zadig to bind a WinUSB driver to the printer, or check Device Manager for driver conflicts.`,
       );
     }
 
     // Add delay before closing
     await new Promise((resolve) => setTimeout(resolve, 1000));
 
-    console.log("✓ Ticket printed successfully");
+    log("✓ Ticket printed successfully");
 
     res.json({
       success: true,
       message: "Ticket printed successfully",
       ticketNumber: queueNumber,
-      method: usedFallbackMethod ? "fallback" : "usb",
+      method: "usb",
+      bytes: data.length,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    console.error("Print error:", error);
+    log(`✗ Print error: ${error.message}`);
     res.status(500).json({
       success: false,
       error: error.message,
-      troubleshooting: `On Windows with printer drivers installed, direct USB access is blocked. Try: 1) Check /debug/devices for your actual printer IDs, 2) Remove printer from Windows Devices, 3) Reinstall with libusb drivers, or 4) Use Windows Print Spooler instead of direct USB`,
+      troubleshooting: [
+        "Check GET /debug/devices for your actual printer vendor/product IDs",
+        "Confirm the printer is bound to a WinUSB driver via Zadig, not the default Windows printer driver",
+        "Check Device Manager for driver conflicts",
+        "Check GET /debug/windows-printers to see printers Windows recognizes",
+      ],
       details: process.env.NODE_ENV === "development" ? error.stack : undefined,
     });
   } finally {
@@ -465,9 +476,9 @@ app.post("/print", async (req, res) => {
       try {
         printerConnection.interface.release();
         printerConnection.device.close();
-        console.log("Printer connection closed");
+        log("Printer connection closed", true);
       } catch (e) {
-        console.error("Error closing printer:", e.message);
+        log(`Error closing printer: ${e.message}`);
       }
     }
   }
@@ -480,7 +491,7 @@ app.post("/test-print", async (req, res) => {
   let printerConnection = null;
 
   try {
-    console.log(`\n🧪 Testing printer...`);
+    log("🧪 Testing printer...");
 
     // Connect to printer
     printerConnection = await connectPrinter();
@@ -506,22 +517,24 @@ app.post("/test-print", async (req, res) => {
     receipt += LF;
 
     const data = Buffer.from(receipt, "binary");
-    console.log(`  Sending test data (${data.length} bytes)...`);
+    log(`Sending test data (${data.length} bytes)...`, true);
 
     await sendToPrinter(printerConnection, data);
 
     // Add delay
     await new Promise((resolve) => setTimeout(resolve, 1000));
 
-    console.log("✓ Test print successful");
+    log("✓ Test print successful");
 
     res.json({
       success: true,
       message: "Test print successful",
+      method: "usb",
+      bytes: data.length,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    console.error("Test print error:", error);
+    log(`✗ Test print error: ${error.message}`);
     res.status(500).json({
       success: false,
       error: error.message,
@@ -532,9 +545,9 @@ app.post("/test-print", async (req, res) => {
       try {
         printerConnection.interface.release();
         printerConnection.device.close();
-        console.log("Printer connection closed");
+        log("Printer connection closed", true);
       } catch (e) {
-        console.error("Error closing printer:", e.message);
+        log(`Error closing printer: ${e.message}`);
       }
     }
   }
@@ -588,7 +601,7 @@ app.get("/debug/windows-printers", (req, res) => {
  * Error handler middleware
  */
 app.use((err, req, res, next) => {
-  console.error("Unhandled error:", err);
+  log(`Unhandled error: ${err.message}`);
   res.status(500).json({
     success: false,
     error: "Internal server error",
@@ -609,19 +622,21 @@ app.listen(PORT, () => {
 Main Endpoints:
   GET  /health              - Health check
   GET  /printers            - List available printers
+  GET  /config              - Show current configuration
+  POST /config              - Update printer vendor/product IDs
   POST /print               - Print a queue ticket
   POST /test-print          - Test printer connection
 
 Debug Endpoints:
   GET  /debug/devices       - List all USB devices with IDs
   GET  /debug/windows-printers - List Windows printers (Windows only)
-  POST /debug/configure     - Set printer vendor/product IDs
 
 Configuration:
   PORT: ${PORT}
   NODE_ENV: ${process.env.NODE_ENV || "development"}
-  VENDOR_ID: 0x${EPSON_VENDOR_ID.toString(16).padStart(4, "0")}
-  PRODUCT_ID: 0x${EPSON_PRODUCT_ID.toString(16).padStart(4, "0")}
+  DEBUG: ${DEBUG}
+  VENDOR_ID: 0x${currentVendorId().toString(16).padStart(4, "0")}
+  PRODUCT_ID: 0x${currentProductId().toString(16).padStart(4, "0")}
 
 TROUBLESHOOTING LIBUSB_ERROR_NOT_SUPPORTED on Windows:
 ─────────────────────────────────────────────────────────────
@@ -634,14 +649,13 @@ Step 1: Check what's connected
 Step 2: If printer is in "Not Found" error:
   a) Verify printer is powered on and connected
   b) Check Device Manager for the printer
-  c) Try: POST /debug/configure with correct vendor/product IDs
+  c) Try: POST /config with correct vendor/product IDs
 
 Step 3: If printer is found but LIBUSB_ERROR_NOT_SUPPORTED occurs:
   a) WINDOWS IS BLOCKING DIRECT USB ACCESS - This is expected!
-  b) Options:
-     - Option A: Uninstall Windows printer driver and install libusb drivers
-     - Option B: Use Windows Print Spooler instead of direct USB
-     - Option C: Use print-to-file and then send file to LPT/COM port
+  b) Fix: Use Zadig (https://zadig.akeo.ie) to bind a WinUSB driver to
+     the printer's USB interface. This replaces the default Windows
+     printer driver, which is what's blocking libusb from claiming it.
 
 Step 4: Test with actual system printer name:
   GET /debug/windows-printers returns available printers
